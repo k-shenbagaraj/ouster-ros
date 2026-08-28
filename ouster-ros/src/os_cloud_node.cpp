@@ -76,6 +76,8 @@ class OusterCloud : public OusterProcessingNodeBase {
         RCLCPP_INFO(get_logger(),
                     "OusterCloud: retrieved new sensor metadata!");
         info = ouster::sdk::core::SensorInfo(metadata_msg->data);
+        packet_format = std::make_shared<ouster::sdk::core::PacketFormat>(
+            ouster::sdk::core::get_format(info));
         if (tf_bcast.publish_static_tf()) {
             tf_bcast.broadcast_transforms(info);
         }
@@ -110,10 +112,13 @@ class OusterCloud : public OusterProcessingNodeBase {
                         // TODO[UN]: this is not ideal since we can't reuse the msg buffer
                         // Need to redefine the Packet object and allow use of array_views
                         ImuPacket imu_packet(msg->buf.size());
-                        memcpy(imu_packet.buf.data(), msg->buf.data(), msg->buf.size());
+                        imu_packet.format = packet_format;
                         imu_packet.host_timestamp = static_cast<uint64_t>(now().nanoseconds());
-                        auto imu_msg = imu_packet_handler(imu_packet);
-                        imu_pub->publish(imu_msg);
+                        memcpy(imu_packet.buf.data(), msg->buf.data(), msg->buf.size());
+                        auto imu_msgs = imu_packet_handler(imu_packet);
+                        for (const auto& imu_msg : imu_msgs) {
+                            imu_pub->publish(imu_msg);
+                        }
                     }
                 });
         }
@@ -234,8 +239,9 @@ class OusterCloud : public OusterProcessingNodeBase {
                     // TODO[UN]: this is not ideal since we can't reuse the msg buffer
                     // Need to redefine the Packet object and allow use of array_views
                     LidarPacket lidar_packet(msg->buf.size());
-                    memcpy(lidar_packet.buf.data(), msg->buf.data(), msg->buf.size());
+                    lidar_packet.format = packet_format;
                     lidar_packet.host_timestamp = static_cast<uint64_t>(now().nanoseconds());
+                    memcpy(lidar_packet.buf.data(), msg->buf.data(), msg->buf.size());
 
                     if (telemetry_handler) {
                         auto telemetry = telemetry_handler(lidar_packet);
