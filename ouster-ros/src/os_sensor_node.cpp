@@ -16,6 +16,7 @@
 
 #include "os_sensor_node.h"
 #include <ouster/metadata.h>
+#include "ouster_ros/impl/file_util.h"
 
 using ouster_sensor_msgs::msg::PacketMsg;
 using ouster_sensor_msgs::srv::GetConfig;
@@ -27,11 +28,13 @@ using namespace std::chrono_literals;
 using ouster::sdk::core::ImuPacket;
 using ouster::sdk::core::LidarPacket;
 using ouster::sdk::core::UDPProfileLidar;
+using ouster::sdk::core::UDPProfileIMU;
 using ouster::sdk::core::LidarMode;
 using ouster::sdk::core::TimestampMode;
 using ouster::sdk::core::OperatingMode;
 using ouster::sdk::core::SensorInfo;
 using ouster::sdk::core::PacketFormat;
+using ouster::sdk::core::SensorConfig;
 
 namespace ouster_ros {
 
@@ -82,6 +85,11 @@ void OusterSensor::declare_parameters() {
     declare_parameter("lidar_mode", "");
     declare_parameter("timestamp_mode", "");
     declare_parameter("udp_profile_lidar", "");
+    declare_parameter("columns_per_packet", 0);
+    declare_parameter("udp_profile_imu", "");
+    declare_parameter("imu_packets_per_frame", 0);
+    declare_parameter("gyro_fsr", "");
+    declare_parameter("accel_fsr", "");
     declare_parameter("use_system_default_qos", false);
     declare_parameter("azimuth_window_start", MIN_AZW);
     declare_parameter("azimuth_window_end", MAX_AZW);
@@ -90,11 +98,29 @@ void OusterSensor::declare_parameters() {
     declare_parameter("dormant_period_between_reconnects", 1.0);
     declare_parameter("max_failed_reconnect_attempts", INT_MAX);
     declare_parameter("auto_start", false);
+    declare_parameter("operating_mode", "");
+    declare_parameter("signal_multiplier", 1.0);
+    declare_parameter("phase_lock_enable", false);
+    declare_parameter("phase_lock_offset", 0);
+    declare_parameter("lidar_frame_azimuth_offset", -1);
+    declare_parameter("return_order", "");
+    declare_parameter("bloom_reduction_optimization", "");
+    declare_parameter("multipurpose_io_mode", "OFF");
+    declare_parameter("nmea_in_polarity", "ACTIVE_HIGH");
+    declare_parameter("nmea_ignore_valid_char", false);
+    declare_parameter("nmea_baud_rate", "BAUD_9600");
+    declare_parameter("nmea_leap_seconds", 0);
+    declare_parameter("sync_pulse_in_polarity", "ACTIVE_HIGH");
+    declare_parameter("sync_pulse_out_polarity", "ACTIVE_LOW");
+    declare_parameter("sync_pulse_out_frequency", -1);
+    declare_parameter("sync_pulse_out_angle", -1);
+    declare_parameter("sync_pulse_out_pulse_width", -1);
+    declare_parameter("min_distance", -1);
 }
 
 bool OusterSensor::start() {
     sensor_hostname = get_sensor_hostname();
-    ouster::sdk::core::SensorConfig config;
+    SensorConfig config;
     if (staged_config) {
         if (!configure_sensor(sensor_hostname, staged_config.value()))
             return false;
@@ -104,7 +130,7 @@ bool OusterSensor::start() {
         if (!get_active_config_no_throw(sensor_hostname, config))
             return false;
 
-        RCLCPP_INFO(get_logger(), "Retrived sensor active config");
+        RCLCPP_INFO(get_logger(), "Retrieved sensor active config");
         // Unfortunately it seems we need to invoke this to force the auto
         // TODO[UN]: find a shortcut
         // Only reset udp_dest if auto_udp was allowed on startup
@@ -263,7 +289,7 @@ void OusterSensor::update_metadata(ouster::sdk::sensor::Client& cli) {
 
     info = ouster::sdk::core::SensorInfo(cached_metadata);
     // TODO: revist when *min_version* is changed
-    populate_metadata_defaults(info, LidarMode::MODE_UNSPEC);
+    populate_metadata_defaults(info);
 
     publish_metadata();
     save_metadata();
@@ -282,7 +308,7 @@ void OusterSensor::save_metadata() {
 
     // write metadata file. If metadata_path is relative, will use cwd
     // (usually ~/.ros)
-    if (write_text_to_file(meta_file, cached_metadata)) {
+    if (impl::write_text_to_file(meta_file, cached_metadata)) {
         RCLCPP_INFO_STREAM(get_logger(),
                            "Wrote sensor metadata to " << meta_file);
     } else {
@@ -345,7 +371,7 @@ void OusterSensor::create_reset_service() {
 }
 
 bool OusterSensor::get_active_config_no_throw(
-    const std::string& sensor_hostname, ouster::sdk::core::SensorConfig& config) {
+    const std::string& sensor_hostname, SensorConfig& config) {
     try {
         if (ouster::sdk::sensor::get_config(sensor_hostname, config, true))
             return true;
@@ -367,7 +393,7 @@ void OusterSensor::create_get_config_service() {
         "get_config", [this](const std::shared_ptr<GetConfig::Request>,
                              std::shared_ptr<GetConfig::Response> response) {
             std::string active_config;
-            ouster::sdk::core::SensorConfig config;
+            SensorConfig config;
             if (get_active_config_no_throw(sensor_hostname, config))
                 active_config = to_string(config);
             response->config = active_config;
@@ -384,7 +410,7 @@ void OusterSensor::create_set_config_service() {
             response->config = "";
             std::string config_str;
             try {
-                config_str = read_text_file(request->config_file);
+                config_str = impl::read_text_file(request->config_file);
                 if (config_str.empty()) {
                     RCLCPP_ERROR_STREAM(
                         get_logger(),
@@ -401,7 +427,7 @@ void OusterSensor::create_set_config_service() {
                 return false;
             }
 
-            ouster::sdk::core::SensorConfig config;
+            SensorConfig config;
             if (!ouster::sdk::core::parse_and_validate_config(config_str, config)) {
                 return false;
             }
@@ -418,7 +444,7 @@ void OusterSensor::create_set_config_service() {
 }
 
 std::shared_ptr<ouster::sdk::sensor::Client> OusterSensor::create_sensor_client(
-    const std::string& hostname, const ouster::sdk::core::SensorConfig& config) {
+    const std::string& hostname, const SensorConfig& config) {
 
     int lidar_port = config.udp_port_lidar ? config.udp_port_lidar.value() : 0;
     int imu_port = config.udp_port_imu ? config.udp_port_imu.value() : 0;
@@ -427,6 +453,14 @@ std::shared_ptr<ouster::sdk::sensor::Client> OusterSensor::create_sensor_client(
     RCLCPP_INFO_STREAM(get_logger(),
                        "Starting sensor " << hostname << " initialization..."
                        " Using ports: " << lidar_port << "/" << imu_port);
+
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
 
     std::shared_ptr<ouster::sdk::sensor::Client> cli;
     if (ouster::sdk::sensor::in_multicast(udp_dest)) {
@@ -440,8 +474,8 @@ std::shared_ptr<ouster::sdk::sensor::Client> OusterSensor::create_sensor_client(
     } else {
         // use the full init_client to generate and assign random ports to
         // sensor
-        cli = ouster::sdk::sensor::init_client(hostname, udp_dest, ouster::sdk::core::MODE_UNSPEC,
-                                  ouster::sdk::core::TIME_FROM_UNSPEC, lidar_port, imu_port);
+        cli = ouster::sdk::sensor::init_client(hostname, udp_dest, LidarMode(0, 0),
+                                  TimestampMode::UNSPECIFIED, lidar_port, imu_port);
     }
 
     if (!cli) {
@@ -450,116 +484,23 @@ std::shared_ptr<ouster::sdk::sensor::Client> OusterSensor::create_sensor_client(
         throw std::runtime_error(error_msg);
     }
 
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+
     return cli;
 }
 
-ouster::sdk::core::SensorConfig OusterSensor::parse_config_from_ros_parameters() {
+void OusterSensor::parse_udp_dest_and_ports(SensorConfig& config) {
     auto udp_dest = get_parameter("udp_dest").as_string();
     if (!is_arg_set(udp_dest))
         udp_dest = get_parameter("computer_ip").as_string();
 
     auto mtp_dest_arg = get_parameter("mtp_dest").as_string();
     auto mtp_main_arg = get_parameter("mtp_main").as_bool();
-    auto lidar_port = get_parameter("lidar_port").as_int();
-    auto imu_port = get_parameter("imu_port").as_int();
-    auto lidar_mode_arg = get_parameter("lidar_mode").as_string();
-    auto timestamp_mode_arg = get_parameter("timestamp_mode").as_string();
-    auto udp_profile_lidar_arg = get_parameter("udp_profile_lidar").as_string();
-    auto azimuth_window_start = get_parameter("azimuth_window_start").as_int();
-    auto azimuth_window_end = get_parameter("azimuth_window_end").as_int();
 
-    if (lidar_port < 0 || lidar_port > 65535) {
-        auto error_msg =
-            "Invalid lidar port number! port value should be in the range "
-            "[0, 65535].";
-        RCLCPP_FATAL_STREAM(get_logger(), error_msg);
-        throw std::runtime_error(error_msg);
-    }
-
-    if (imu_port < 0 || imu_port > 65535) {
-        auto error_msg =
-            "Invalid imu port number! port value should be in the range "
-            "[0, 65535].";
-        RCLCPP_FATAL_STREAM(get_logger(), error_msg);
-        throw std::runtime_error(error_msg);
-    }
-
-    nonstd::optional<UDPProfileLidar> udp_profile_lidar;
-    if (is_arg_set(udp_profile_lidar_arg)) {
-        // set lidar profile from param
-        udp_profile_lidar =
-            ouster::sdk::core::udp_profile_lidar_of_string(udp_profile_lidar_arg);
-        if (!udp_profile_lidar) {
-            auto error_msg =
-                "Invalid udp profile lidar: " + udp_profile_lidar_arg;
-            RCLCPP_FATAL_STREAM(get_logger(), error_msg);
-            throw std::runtime_error(error_msg);
-        }
-    }
-
-    // set lidar mode from param
-    LidarMode lidar_mode = LidarMode::MODE_UNSPEC;
-    if (is_arg_set(lidar_mode_arg)) {
-        lidar_mode = ouster::sdk::core::lidar_mode_of_string(lidar_mode_arg);
-        if (lidar_mode == LidarMode::MODE_UNSPEC) {
-            auto error_msg = "Invalid lidar mode: " + lidar_mode_arg;
-            RCLCPP_FATAL_STREAM(get_logger(), error_msg);
-            throw std::runtime_error(error_msg);
-        }
-    }
-
-    // set timestamp mode from param
-    TimestampMode timestamp_mode = TimestampMode::TIME_FROM_UNSPEC;
-    if (is_arg_set(timestamp_mode_arg)) {
-        // In case the option TIME_FROM_ROS_TIME is set then leave the
-        // sensor timestamp_mode unmodified
-        if (timestamp_mode_arg == "TIME_FROM_ROS_TIME" ||
-            timestamp_mode_arg == "TIME_FROM_ROS_RECEPTION") {
-            RCLCPP_INFO(get_logger(),
-                        "TIME_FROM_ROS_TIME timestamp mode specified."
-                        " IMU and pointcloud messages will use ros time");
-        } else {
-            timestamp_mode =
-                ouster::sdk::core::timestamp_mode_of_string(timestamp_mode_arg);
-            if (timestamp_mode == TimestampMode::TIME_FROM_UNSPEC) {
-                auto error_msg =
-                    "Invalid timestamp mode: " + timestamp_mode_arg;
-                RCLCPP_FATAL_STREAM(get_logger(), error_msg);
-                throw std::runtime_error(error_msg);
-            }
-        }
-    }
-
-    ouster::sdk::core::SensorConfig config;
-    if (lidar_port == 0) {
-        RCLCPP_WARN_EXPRESSION(
-            get_logger(), !is_arg_set(mtp_dest_arg),
-            "lidar port set to zero, the client will assign a random port "
-            "number!");
-    } else {
-        config.udp_port_lidar = lidar_port;
-    }
-
-    if (imu_port == 0) {
-        RCLCPP_WARN_EXPRESSION(
-            get_logger(), !is_arg_set(mtp_dest_arg),
-            "imu port set to zero, the client will assign a random port "
-            "number!");
-    } else {
-        config.udp_port_imu = imu_port;
-    }
-
-    persist_config = get_parameter("persist_config").as_bool();
-    if (persist_config && (lidar_port == 0 || imu_port == 0)) {
-        RCLCPP_WARN(get_logger(), "When using persist_config it is recommended "
-        " to not use 0 for port values as this currently will trigger sensor "
-        " reinit event each time");
-    }
-
-    config.udp_profile_lidar = udp_profile_lidar;
-    config.operating_mode = OperatingMode::OPERATING_NORMAL;
-    if (lidar_mode != LidarMode::MODE_UNSPEC) config.lidar_mode = lidar_mode;
-    if (timestamp_mode != TimestampMode::TIME_FROM_UNSPEC) config.timestamp_mode = timestamp_mode;
     if (is_arg_set(udp_dest)) {
         config.udp_dest = udp_dest;
         if (ouster::sdk::sensor::in_multicast(udp_dest)) {
@@ -570,6 +511,171 @@ ouster::sdk::core::SensorConfig OusterSensor::parse_config_from_ros_parameters()
         auto_udp_allowed = true;
     }
 
+    // parse lidar port
+    auto lidar_port = get_parameter("lidar_port").as_int();
+    if (lidar_port < 0 || lidar_port > 65535) {
+        auto error_msg =
+            "Invalid lidar port number! port value should be in the range "
+            "[0, 65535].";
+        RCLCPP_FATAL_STREAM(get_logger(), error_msg);
+        throw std::runtime_error(error_msg);
+    }
+
+    if (lidar_port == 0) {
+        RCLCPP_WARN_EXPRESSION(
+            get_logger(), !is_arg_set(mtp_dest_arg),
+            "lidar port set to zero, the client will assign a random port "
+            "number!");
+    } else {
+        config.udp_port_lidar = lidar_port;
+    }
+
+    // parse imu port
+    auto imu_port = get_parameter("imu_port").as_int();
+    if (imu_port < 0 || imu_port > 65535) {
+        auto error_msg =
+            "Invalid imu port number! port value should be in the range "
+            "[0, 65535].";
+        RCLCPP_FATAL_STREAM(get_logger(), error_msg);
+        throw std::runtime_error(error_msg);
+    }
+
+    if (imu_port == 0) {
+        RCLCPP_WARN_EXPRESSION(
+            get_logger(), !is_arg_set(mtp_dest_arg),
+            "imu port set to zero, the client will assign a random port "
+            "number!");
+    } else {
+        config.udp_port_imu = imu_port;
+    }
+}
+
+void OusterSensor::parse_udp_profile_lidar(SensorConfig& config) {
+    auto udp_profile_lidar_arg = get_parameter("udp_profile_lidar").as_string();
+    if (!is_arg_set(udp_profile_lidar_arg)) {
+        return;
+    }
+
+    auto udp_profile_lidar =
+        ouster::sdk::core::udp_profile_lidar_of_string(udp_profile_lidar_arg);
+    if (!udp_profile_lidar) {
+        auto error_msg =
+            "Invalid udp profile lidar: " + udp_profile_lidar_arg;
+        RCLCPP_FATAL_STREAM(get_logger(), error_msg);
+        throw std::runtime_error(error_msg);
+    }
+    config.udp_profile_lidar = udp_profile_lidar;
+}
+
+void OusterSensor::parse_columns_per_packet(SensorConfig& config) {
+    auto columns_per_packet = get_parameter("columns_per_packet").as_int();
+    if (columns_per_packet == 0) {
+        return;
+    }
+    auto valid_values = std::vector<int>{1, 2, 4, 8, 16, 32, 64};
+    if (std::find(valid_values.begin(), valid_values.end(), columns_per_packet) == valid_values.end()) {
+        RCLCPP_FATAL(get_logger(), "columns_per_packet needs to be one of the values: {1, 2, 4, 8, 16, 32, 64}");
+        throw std::runtime_error("invalid columns_per_packet value!");
+    }
+    config.columns_per_packet = columns_per_packet;
+}
+
+void OusterSensor::parse_udp_profile_imu_and_settings(SensorConfig& config) {
+    auto udp_profile_imu_arg = get_parameter("udp_profile_imu").as_string();
+
+    if (is_arg_set(udp_profile_imu_arg)) {
+        auto udp_profile_imu =
+            ouster::sdk::core::udp_profile_imu_of_string(udp_profile_imu_arg);
+        if (!udp_profile_imu) {
+            auto error_msg =
+                "Invalid udp profile imu: " + udp_profile_imu_arg;
+            RCLCPP_FATAL_STREAM(get_logger(), error_msg);
+            throw std::runtime_error(error_msg);
+        }
+        config.udp_profile_imu = udp_profile_imu;
+    }
+
+
+    auto imu_packets_per_frame = get_parameter("imu_packets_per_frame").as_int();
+    if (imu_packets_per_frame != 0) {
+        auto valid_values = std::vector<int>{1, 2, 4, 8};
+        if (std::find(valid_values.begin(), valid_values.end(),
+                        imu_packets_per_frame) == valid_values.end()) {
+            RCLCPP_FATAL(get_logger(),
+                "imu_packets_per_frame needs to be one of the values: {1, 2, 4, 8}");
+            throw std::runtime_error("invalid imu_packets_per_frame value!");
+        }
+        config.imu_packets_per_frame = imu_packets_per_frame;
+    }
+
+    auto gyro_fsr_arg = get_parameter("gyro_fsr").as_string();
+    if (is_arg_set(gyro_fsr_arg)) {
+        auto gyro_fsr = ouster::sdk::core::full_scale_range_of_string(gyro_fsr_arg);
+        if (!gyro_fsr) {
+            auto error_msg = "Invalid gyro fsr: " + gyro_fsr_arg;
+            RCLCPP_FATAL_STREAM(get_logger(), error_msg);
+            throw std::runtime_error(error_msg);
+        }
+        config.gyro_fsr = gyro_fsr.value();
+    }
+
+    auto accel_fsr_arg = get_parameter("accel_fsr").as_string();
+    if (is_arg_set(accel_fsr_arg)) {
+        auto accel_fsr = ouster::sdk::core::full_scale_range_of_string(accel_fsr_arg);
+        if (!accel_fsr) {
+            auto error_msg = "Invalid accel fsr: " + accel_fsr_arg;
+            RCLCPP_FATAL_STREAM(get_logger(), error_msg);
+            throw std::runtime_error(error_msg);
+        }
+        config.accel_fsr = accel_fsr.value();
+    }
+}
+
+void OusterSensor::parse_lidar_mode(SensorConfig& config) {
+    auto lidar_mode_arg = get_parameter("lidar_mode").as_string();
+    if (!is_arg_set(lidar_mode_arg)) {
+        return;
+    }
+
+    try {
+        auto lidar_mode = ouster::sdk::core::lidar_mode_of_string(lidar_mode_arg);
+        config.lidar_mode = lidar_mode;
+    } catch (const std::exception& e) {
+        auto error_msg = "Invalid lidar mode: " + lidar_mode_arg + ", exception details: " + e.what();
+        RCLCPP_FATAL_STREAM(get_logger(), error_msg);
+        throw std::runtime_error(error_msg);
+    }
+}
+
+void OusterSensor::parse_timestamp_mode(SensorConfig& config) {
+    auto timestamp_mode_arg = get_parameter("timestamp_mode").as_string();
+    if (!is_arg_set(timestamp_mode_arg)) {
+        return;
+    }
+
+    // In case the option TIME_FROM_ROS_TIME is set then leave the
+    // sensor timestamp_mode unmodified
+    if (timestamp_mode_arg == "TIME_FROM_ROS_TIME" ||
+        timestamp_mode_arg == "TIME_FROM_ROS_RECEPTION") {
+        RCLCPP_INFO(get_logger(),
+                    "TIME_FROM_ROS_TIME timestamp mode specified."
+                    " IMU and pointcloud messages will use ros time");
+    } else {
+        auto timestamp_mode =
+            ouster::sdk::core::timestamp_mode_of_string(timestamp_mode_arg);
+        if (timestamp_mode == TimestampMode::UNSPECIFIED) {
+            auto error_msg =
+                "Invalid timestamp mode: " + timestamp_mode_arg;
+            RCLCPP_FATAL_STREAM(get_logger(), error_msg);
+            throw std::runtime_error(error_msg);
+        }
+        config.timestamp_mode = timestamp_mode;
+    }
+}
+
+void OusterSensor::parse_azimuth_window(SensorConfig& config) {
+    auto azimuth_window_start = get_parameter("azimuth_window_start").as_int();
+    auto azimuth_window_end = get_parameter("azimuth_window_end").as_int();
     if (azimuth_window_start < MIN_AZW || azimuth_window_start > MAX_AZW ||
         azimuth_window_end < MIN_AZW || azimuth_window_end > MAX_AZW) {
         auto error_msg = "azimuth window values must be between " +
@@ -579,7 +685,241 @@ ouster::sdk::core::SensorConfig OusterSensor::parse_config_from_ros_parameters()
     }
 
     config.azimuth_window = {azimuth_window_start, azimuth_window_end};
+}
 
+void OusterSensor::parse_operating_mode(SensorConfig& config) {
+    auto operating_mode_arg = get_parameter("operating_mode").as_string();
+    if (!is_arg_set(operating_mode_arg)) {
+        return;
+    }
+
+    auto operating_mode = ouster::sdk::core::operating_mode_of_string(operating_mode_arg);
+    if (!operating_mode) {
+        auto error_msg = "Invalid operating mode: " + operating_mode_arg;
+        RCLCPP_FATAL_STREAM(get_logger(), error_msg);
+        throw std::runtime_error(error_msg);
+    }
+    config.operating_mode = operating_mode.value();
+}
+
+void OusterSensor::parse_signal_multiplier(SensorConfig& config) {
+    auto signal_multiplier = get_parameter("signal_multiplier").as_double();
+    try {
+        ouster::sdk::core::check_signal_multiplier(signal_multiplier);
+    } catch (const std::exception& e) {
+        auto error_msg = "Invalid signal multiplier: " + to_string(signal_multiplier) +
+                         ", exception details: " + e.what();
+        RCLCPP_FATAL_STREAM(get_logger(), error_msg);
+        throw std::runtime_error(error_msg);
+    }
+    config.signal_multiplier = signal_multiplier;
+}
+
+void OusterSensor::parse_multipurpose_io_mode(SensorConfig& config) {
+    auto arg = get_parameter("multipurpose_io_mode").as_string();
+    if (!is_arg_set(arg)) {
+        return;
+    }
+    auto mode = ouster::sdk::core::multipurpose_io_mode_of_string(arg);
+    if (!mode) {
+        auto error_msg = "Invalid multipurpose io mode: " + arg;
+        RCLCPP_FATAL_STREAM(get_logger(), error_msg);
+        throw std::runtime_error(error_msg);
+    }
+    config.multipurpose_io_mode = mode.value();
+}
+
+void OusterSensor::parse_nmea_in_polarity(SensorConfig& config) {
+    auto arg = get_parameter("nmea_in_polarity").as_string();
+    if (!is_arg_set(arg)) {
+        return;
+    }
+    auto polarity = ouster::sdk::core::polarity_of_string(arg);
+    if (!polarity) {
+        auto error_msg = "Invalid nmea in polarity: " + arg;
+        RCLCPP_FATAL_STREAM(get_logger(), error_msg);
+        throw std::runtime_error(error_msg);
+    }
+    config.nmea_in_polarity = polarity.value();
+}
+
+void OusterSensor::parse_nmea_ignore_valid_char(SensorConfig& config) {
+    config.nmea_ignore_valid_char =
+        get_parameter("nmea_ignore_valid_char").as_bool();
+}
+
+void OusterSensor::parse_nmea_baud_rate(SensorConfig& config) {
+    auto arg = get_parameter("nmea_baud_rate").as_string();
+    if (!is_arg_set(arg)) {
+        return;
+    }
+    auto rate = ouster::sdk::core::nmea_baud_rate_of_string(arg);
+    if (!rate) {
+        auto error_msg = "Invalid nmea baud rate: " + arg;
+        RCLCPP_FATAL_STREAM(get_logger(), error_msg);
+        throw std::runtime_error(error_msg);
+    }
+    config.nmea_baud_rate = rate.value();
+}
+
+void OusterSensor::parse_nmea_leap_seconds(SensorConfig& config) {
+    config.nmea_leap_seconds = get_parameter("nmea_leap_seconds").as_int();
+}
+
+void OusterSensor::parse_sync_pulse_in_polarity(SensorConfig& config) {
+    auto arg = get_parameter("sync_pulse_in_polarity").as_string();
+    if (!is_arg_set(arg)) {
+        return;
+    }
+    auto polarity = ouster::sdk::core::polarity_of_string(arg);
+    if (!polarity) {
+        auto error_msg = "Invalid sync pulse in polarity: " + arg;
+        RCLCPP_FATAL_STREAM(get_logger(), error_msg);
+        throw std::runtime_error(error_msg);
+    }
+    config.sync_pulse_in_polarity = polarity.value();
+}
+
+void OusterSensor::parse_sync_pulse_out_polarity(SensorConfig& config) {
+    auto arg = get_parameter("sync_pulse_out_polarity").as_string();
+    if (!is_arg_set(arg)) {
+        return;
+    }
+    auto polarity = ouster::sdk::core::polarity_of_string(arg);
+    if (!polarity) {
+        auto error_msg = "Invalid sync pulse out polarity: " + arg;
+        RCLCPP_FATAL_STREAM(get_logger(), error_msg);
+        throw std::runtime_error(error_msg);
+    }
+    config.sync_pulse_out_polarity = polarity.value();
+}
+
+void OusterSensor::parse_sync_pulse_out_frequency(SensorConfig& config) {
+    auto val = get_parameter("sync_pulse_out_frequency").as_int();
+    if (val < 0) {
+        return;
+    }
+    config.sync_pulse_out_frequency = val;
+}
+
+void OusterSensor::parse_sync_pulse_out_angle(SensorConfig& config) {
+    auto val = get_parameter("sync_pulse_out_angle").as_int();
+    if (val < 0) {
+        return;
+    }
+    config.sync_pulse_out_angle = val;
+}
+
+void OusterSensor::parse_sync_pulse_out_pulse_width(SensorConfig& config) {
+    auto val = get_parameter("sync_pulse_out_pulse_width").as_int();
+    if (val < 0) {
+        return;
+    }
+    config.sync_pulse_out_pulse_width = val;
+}
+
+void OusterSensor::parse_phase_lock_and_offset(SensorConfig& config) {
+    config.phase_lock_enable = get_parameter("phase_lock_enable").as_bool();
+    auto phase_lock_offset = get_parameter("phase_lock_offset").as_int();
+    if (phase_lock_offset < MIN_AZW || phase_lock_offset > MAX_AZW) {
+        auto error_msg = "phase_lock_offset must be between 0 and 360000 millidegrees";
+        RCLCPP_FATAL_STREAM(get_logger(), error_msg);
+        throw std::runtime_error(error_msg);
+    }
+    config.phase_lock_offset = phase_lock_offset;
+}
+
+void OusterSensor::parse_min_distance(SensorConfig& config) {
+    auto val = get_parameter("min_distance").as_int();
+    if (val < 0) {
+        return;
+    }
+    auto valid = std::vector<int>{0, 30, 50};
+    if (std::find(valid.begin(), valid.end(), val) == valid.end()) {
+        auto error_msg =
+            "Invalid min_distance: " + to_string(val) +
+            "; must be -1 (unset) or one of {0, 30, 50} (cm)";
+        RCLCPP_FATAL_STREAM(get_logger(), error_msg);
+        throw std::runtime_error(error_msg);
+    }
+    config.min_range_threshold_cm = val;
+}
+
+void OusterSensor::parse_lidar_frame_azimuth_offset(SensorConfig& config) {
+    auto azimuth_offset = get_parameter("lidar_frame_azimuth_offset").as_int();
+    if (azimuth_offset < 0) {
+        return;
+    }
+    config.lidar_frame_azimuth_offset = azimuth_offset;
+}
+
+void OusterSensor::parse_return_order(SensorConfig& config) {
+    auto return_order_arg = get_parameter("return_order").as_string();
+    if (!is_arg_set(return_order_arg)) {
+        return;
+    }
+
+    auto return_order = ouster::sdk::core::return_order_of_string(return_order_arg);
+    if (!return_order) {
+        auto error_msg = "Invalid return order: " + return_order_arg;
+        RCLCPP_FATAL_STREAM(get_logger(), error_msg);
+        throw std::runtime_error(error_msg);
+    }
+    config.return_order = return_order.value();
+}
+
+void OusterSensor::parse_bloom_reduction_optimization(SensorConfig& config) {
+    auto bloom_reduction_arg = get_parameter("bloom_reduction_optimization").as_string();
+    if (!is_arg_set(bloom_reduction_arg)) {
+        return;
+    }
+    auto bloom_reduction = ouster::sdk::core::bloom_reduction_optimization_of_string(bloom_reduction_arg);
+    if (!bloom_reduction) {
+        auto error_msg = "Invalid bloom reduction optimization: " + bloom_reduction_arg;
+        RCLCPP_FATAL_STREAM(get_logger(), error_msg);
+        throw std::runtime_error(error_msg);
+    }
+    config.bloom_reduction_optimization = bloom_reduction.value();
+}
+
+void OusterSensor::parse_persist_config_flag() {
+    auto lidar_port = get_parameter("lidar_port").as_int();
+    auto imu_port = get_parameter("imu_port").as_int();
+    persist_config = get_parameter("persist_config").as_bool();
+    if (persist_config && (lidar_port == 0 || imu_port == 0)) {
+        RCLCPP_WARN(get_logger(), "When using persist_config it is recommended "
+        " to not use 0 for port values as this currently will trigger sensor "
+        " reinit event each time");
+    }
+}
+
+SensorConfig OusterSensor::parse_config_from_ros_parameters() {
+    SensorConfig config;
+    parse_udp_dest_and_ports(config);
+    parse_udp_profile_lidar(config);
+    parse_columns_per_packet(config);
+    parse_udp_profile_imu_and_settings(config);
+    parse_lidar_mode(config);
+    parse_timestamp_mode(config);
+    parse_azimuth_window(config);
+    parse_operating_mode(config);
+    parse_signal_multiplier(config);
+    parse_multipurpose_io_mode(config);
+    parse_nmea_in_polarity(config);
+    parse_nmea_ignore_valid_char(config);
+    parse_nmea_baud_rate(config);
+    parse_nmea_leap_seconds(config);
+    parse_sync_pulse_in_polarity(config);
+    parse_sync_pulse_out_polarity(config);
+    parse_sync_pulse_out_frequency(config);
+    parse_sync_pulse_out_angle(config);
+    parse_sync_pulse_out_pulse_width(config);
+    parse_phase_lock_and_offset(config);
+    parse_min_distance(config);
+    parse_lidar_frame_azimuth_offset(config);
+    parse_return_order(config);
+    parse_bloom_reduction_optimization(config);
+    parse_persist_config_flag();
     return config;
 }
 
@@ -594,11 +934,11 @@ uint8_t OusterSensor::compose_config_flags(
             if (is_arg_set(mtp_dest)) {
                 RCLCPP_INFO_STREAM(
                     get_logger(),
-                    "Will recieve data via multicast on " << mtp_dest);
+                    "Will receive data via multicast on " << mtp_dest);
             } else {
                 RCLCPP_INFO(
                     get_logger(),
-                    "mtp_dest was not set, will recieve data via multicast "
+                    "mtp_dest was not set, will receive data via multicast "
                     "on first available interface");
             }
         }
@@ -622,8 +962,8 @@ uint8_t OusterSensor::compose_config_flags(
     return config_flags;
 }
 
-bool OusterSensor::configure_sensor(const std::string& hostname,
-                                    ouster::sdk::core::SensorConfig& config) {
+bool OusterSensor::configure_sensor(
+    const std::string& hostname, SensorConfig& config) {
     if (config.udp_dest && ouster::sdk::sensor::in_multicast(config.udp_dest.value()) &&
         !mtp_main) {
         if (!ouster::sdk::sensor::get_config(hostname, config, true)) {
@@ -631,7 +971,7 @@ bool OusterSensor::configure_sensor(const std::string& hostname,
             return false;
         }
 
-        RCLCPP_INFO(get_logger(), "Retrived active config of sensor");
+        RCLCPP_INFO(get_logger(), "Retrieved active config of sensor");
         return true;
     }
 
@@ -652,8 +992,8 @@ bool OusterSensor::configure_sensor(const std::string& hostname,
 
 // fill in values that could not be parsed from metadata
 void OusterSensor::populate_metadata_defaults(
-    SensorInfo& info, LidarMode specified_lidar_mode) {
-    ouster::sdk::core::Version v = ouster::sdk::core::version_from_string(info.fw_rev);
+    SensorInfo& info) {
+    ouster::sdk::core::Version v = ouster::sdk::core::version_from_string(info.image_rev);
     if (v == ouster::sdk::core::INVALID_VERSION)
         RCLCPP_WARN(
             get_logger(),
@@ -662,13 +1002,6 @@ void OusterSensor::populate_metadata_defaults(
         RCLCPP_WARN(get_logger(),
                     "Firmware < %s not supported; output may not be reliable",
                     ouster::sdk::sensor::MIN_VERSION.simple_version_string().c_str());
-
-    if (!info.config.lidar_mode) {
-        RCLCPP_WARN(
-            get_logger(),
-            "Lidar mode not found in metadata; output may not be reliable");
-        info.config.lidar_mode = specified_lidar_mode;
-    }
 
     if (!info.prod_line.size()) info.prod_line = "UNKNOWN";
 
@@ -708,9 +1041,12 @@ void OusterSensor::create_publishers() {
 
 void OusterSensor::allocate_buffers() {
     auto& pf = ouster::sdk::core::get_format(info);
+    auto packet_format = std::make_shared<PacketFormat>(pf);
     lidar_packet.buf.resize(pf.lidar_packet_size);
+    lidar_packet.format = packet_format;
     lidar_packet_msg.buf.resize(pf.lidar_packet_size);
     imu_packet.buf.resize(pf.imu_packet_size);
+    imu_packet.format = packet_format;
     imu_packet_msg.buf.resize(pf.imu_packet_size);
 }
 
